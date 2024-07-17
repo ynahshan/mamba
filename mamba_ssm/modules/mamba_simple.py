@@ -126,7 +126,7 @@ class Mamba(nn.Module):
         conv_state, ssm_state = None, None
         if inference_params is not None:
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
-            if inference_params.seqlen_offset > 0:
+            if inference_params.seqlen_offset > 0 and seqlen == 1:
                 # The states are updated inplace
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
@@ -161,20 +161,27 @@ class Mamba(nn.Module):
         else:
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
-                    x=x,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                )
+            # if conv_state is not None:
+            #     # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            #     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            #     conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+
+            # if conv_state is None:
+            # conv_state = torch.zeros(b, d * self.expand, self.d_conv, device = x.device)
+            x = torch.cat((conv_state, x), dim=2)
+            conv_state.copy_(x[:, :, -self.d_conv:])
+            x = self.act(self.conv1d(x)[:, :, self.d_conv:self.d_conv + seqlen])
+
+            # if causal_conv1d_fn is None:
+            #     x = self.act(self.conv1d(x)[..., :seqlen])
+            # else:
+            #     assert self.activation in ["silu", "swish"]
+            #     x = causal_conv1d_fn(
+            #         x=x,
+            #         weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+            #         bias=self.conv1d.bias,
+            #         activation=self.activation,
+            #     )
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
@@ -186,18 +193,20 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
-            y = selective_scan_fn(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                self.D.float(),
-                z=z,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-                return_last_state=ssm_state is not None,
-            )
+            # y = selective_scan_fn(
+            #     x,
+            #     dt,
+            #     A,
+            #     B,
+            #     C,
+            #     self.D.float(),
+            #     z=z,
+            #     delta_bias=self.dt_proj.bias.float(),
+            #     delta_softplus=True,
+            #     return_last_state=ssm_state is not None,
+            # )
+            y = self.selective_scan(x, dt, A, B, C, self.D.float(), z=z, delta_bias=self.dt_proj.bias.float(), 
+                                      delta_softplus=True, ssm_state=ssm_state)
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
@@ -251,6 +260,78 @@ class Mamba(nn.Module):
 
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
+
+    def selective_scan(self, x, delta, A, B, C, D, z=None, delta_bias=None, delta_softplus=False, ssm_state=None):
+            """Does selective scan algorithm. See:
+                - Section 2 State Space Models in the Mamba paper [1]
+                - Algorithm 2 in Section 3.2 in the Mamba paper [1]
+                - run_SSM(A, B, C, u) in The Annotated S4 [2]
+            This is the classic discrete state space formula:
+                h(t + 1) = Ah(t) + Bx(t)
+                y(t)     = Ch(t) + Dx(t)
+                ------------------------
+                BX = B*X
+                DX = D*X
+                h(t + 1) = Ah(t) + BX[t]
+                y(t)     = Ch(t)
+                Y = Y + DX
+            except B and C (and the step size delta, which is used for discretization) are dependent on the input x(t).
+        
+            Args:
+                x: shape (b, l, hidden_dim)    (See Glossary at top for definitions of b, l, hidden_dim, n...)
+                delta: shape (b, l, hidden_dim)
+                A: shape (hidden_dim, d_state)
+                B: shape (b, l, d_state)
+                C: shape (b, l, d_state)
+                D: shape (hidden_dim)
+        
+            Returns:
+                output: shape (b, l, hidden_dim)
+        
+            Official Implementation:
+                selective_scan_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L86
+                Note: I refactored some parts out of `selective_scan_ref` out, so the functionality doesn't match exactly.
+            """
+            x = rearrange(x, 'b d l -> b l d')
+            B = rearrange(B, 'b d l -> b l d')
+            C = rearrange(C, 'b d l -> b l d')
+
+            (b, l, hidden_dim) = x.shape
+            n = A.shape[1]
+
+            if delta_bias is not None:
+                delta = delta + delta_bias[..., None].float()
+            if delta_softplus:
+                delta = F.softplus(delta)
+            
+            # Discretize continuous parameters (A, B)
+            # - A is discretized using zero-order hold (ZOH) discretization (see Section 2 Equation 4 in the Mamba paper [1])
+            # - B is discretized using a simplified Euler discretization instead of ZOH. From a discussion with authors:
+            #   "A is the more important term and the performance doesn't change much with the simplification on B"
+            # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
+            # Note that the below is sequential, while the official implementation does a much faster parallel scan that
+            # is additionally hardware-aware (like FlashAttention).
+            deltaA = torch.exp(torch.einsum('bdl,dn->bldn', delta, A))
+            deltaBX = torch.einsum('bdl,bln,bld->bldn', delta, B, x)
+            y = torch.empty((b, l, hidden_dim), device=deltaA.device)
+            # -- Build h --
+            if ssm_state is not None:
+                h = ssm_state
+            else:
+                h = torch.zeros((b, hidden_dim, n), device=deltaA.device)
+            # -- TODO, how to fast it in parallel? --
+            for i in range(l):
+                h = deltaA[:, i] * h + deltaBX[:, i]
+                y[:,i] = torch.einsum('bdn,bn->bd', h, C[:, i]) # BUG? the h is not h(t), it is already set to h(t+1) in prev line
+            
+            # -- Save h --
+            # if state is not None:
+            #     ssm_state.copy_(h)
+            out = y + x * D
+            out = rearrange(out, 'b l d -> b d l')
+            if z is not None:
+                out = out * F.silu(z)
+            return out, h
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device
